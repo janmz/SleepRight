@@ -32,7 +32,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
 
@@ -45,4 +45,5 @@ jobs:
       uses: golangci/golangci-lint-action@v3
       with:
         version: latest
+        args: --out-format=colored-line-number
 
