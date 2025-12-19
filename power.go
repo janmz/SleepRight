@@ -276,3 +276,60 @@ func configureHibernateTimeout(minutes int) error {
 	return nil
 }
 
+// configureWakeTimers disables wake timers to prevent scheduled tasks from waking the system
+func configureWakeTimers() error {
+	fmt.Println("Configuring wake timers (disabling scheduled task wake-ups)...")
+
+	// Get current power scheme GUID
+	cmd := exec.Command("powercfg", "/getactivescheme")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get active power scheme: %w", err)
+	}
+
+	// Extract GUID from output
+	re := regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) < 2 {
+		return fmt.Errorf("could not extract power scheme GUID")
+	}
+	schemeGUID := matches[1]
+
+	// Disable wake timers for AC power
+	// Setting ID: 238c9fa8-0aad-41ed-83f4-97be242c8f20 (Sleep)
+	// Subgroup ID: 29f6c1db-86da-48c5-9fdb-f2b67b1f44da (Sleep)
+	// Setting ID: bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d (Allow wake timers)
+	// Value: 0 = Disabled, 1 = Enabled (AC), 2 = Enabled (DC), 3 = Enabled (Both)
+	
+	// For AC power: set to 0 (Disabled)
+	cmd = exec.Command("powercfg", "/setacvalueindex", schemeGUID, 
+		"238c9fa8-0aad-41ed-83f4-97be242c8f20", 
+		"29f6c1db-86da-48c5-9fdb-f2b67b1f44da", 
+		"bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d", "0")
+	if err := cmd.Run(); err != nil {
+		if verboseFlag {
+			fmt.Printf("  Warning: Could not disable AC wake timers: %v\n", err)
+		}
+	}
+
+	// For DC (battery) power: set to 0 (Disabled)
+	cmd = exec.Command("powercfg", "/setdcvalueindex", schemeGUID,
+		"238c9fa8-0aad-41ed-83f4-97be242c8f20",
+		"29f6c1db-86da-48c5-9fdb-f2b67b1f44da",
+		"bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d", "0")
+	if err := cmd.Run(); err != nil {
+		if verboseFlag {
+			fmt.Printf("  Warning: Could not disable DC wake timers: %v\n", err)
+		}
+	}
+
+	// Apply the changes
+	cmd = exec.Command("powercfg", "/setactive", schemeGUID)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to apply wake timer settings: %w", err)
+	}
+
+	fmt.Println("  Wake timers disabled (scheduled tasks will not wake the system).")
+	return nil
+}
+

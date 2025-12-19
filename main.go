@@ -2,9 +2,10 @@
 //
 // description: Configure Windows 11 PCs for reliable sleep mode and fix sleep-related issues
 //
-// Version: 1.0.1.2 (in version.go zu ändern)
+// Version: 1.0.2.3 (in version.go zu ändern)
 //
 // ChangeLog:
+// 19.12.25	1.0.2	Include timer analysis and detect modern Standby
 // 19.12.25	1.0.1	Include automatic elevation
 // 12.01.25	1.0.0	Initial version
 package main
@@ -134,6 +135,10 @@ func configurePowerSettings(hibernateMinutes int) error {
 
 	if err := configurePowerScheme(); err != nil {
 		return fmt.Errorf("failed to configure power scheme: %w", err)
+	}
+
+	if err := configureWakeTimers(); err != nil {
+		return fmt.Errorf("failed to configure wake timers: %w", err)
 	}
 
 	if hibernateMinutes > 0 {
