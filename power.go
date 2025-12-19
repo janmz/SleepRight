@@ -6,86 +6,241 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/yusufpapurcu/wmi"
 )
 
-func showPowerSettings() error {
+func showPowerSettings(full bool) error {
 	// Get current power scheme
-	cmd := exec.Command("powercfg", "/getactivescheme")
-	output, err := cmd.Output()
+	outputStr, err := runCommandWithEncoding("powercfg", "/getactivescheme")
 	if err != nil {
-		return fmt.Errorf("failed to get active power scheme: %w", err)
+		return fmt.Errorf("Fehler beim Abrufen des aktiven Energieschemas: %w", err)
 	}
-	fmt.Printf("Active Power Scheme:\n%s\n", string(output))
+	printUTF8ln("Aktives Energieschema:")
+	printUTF8ln(outputStr)
 
 	// Get sleep timeout settings
 	if err := showSleepSettings(); err != nil {
-		return fmt.Errorf("failed to show sleep settings: %w", err)
+		return fmt.Errorf("Fehler beim Anzeigen der Ruhezustand-Einstellungen: %w", err)
 	}
 
 	// Get hibernate timeout settings
 	if err := showHibernateSettings(); err != nil {
-		return fmt.Errorf("failed to show hibernate settings: %w", err)
+		return fmt.Errorf("Fehler beim Anzeigen der Ruhezustand-Einstellungen: %w", err)
 	}
 
 	// Get wake device settings
-	if err := showWakeDeviceSettings(); err != nil {
-		return fmt.Errorf("failed to show wake device settings: %w", err)
+	if err := showWakeDeviceSettings(full); err != nil {
+		return fmt.Errorf("Fehler beim Anzeigen der Aufweck-Geräte-Einstellungen: %w", err)
 	}
 
 	return nil
 }
 
 func showSleepSettings() error {
-	cmd := exec.Command("powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE")
-	output, err := cmd.Output()
+	outputStr, err := runCommandWithEncoding("powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE")
 	if err != nil {
-		return fmt.Errorf("failed to get sleep settings: %w", err)
+		return fmt.Errorf("Fehler beim Abrufen der Ruhezustand-Einstellungen: %w", err)
 	}
 
-	fmt.Println("\nSleep Settings (AC Power):")
-	parsePowerSetting(string(output), "AC Setting Index")
+	printUTF8ln("\nRuhezustand-Einstellungen (Netzbetrieb):")
+	parsePowerSetting(outputStr, "AC Setting Index")
 
-	cmd = exec.Command("powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE")
-	output, err = cmd.Output()
-	if err == nil {
-		fmt.Println("\nSleep Settings (Battery):")
-		parsePowerSetting(string(output), "DC Setting Index")
-	}
+	printUTF8ln("\nRuhezustand-Einstellungen (Batterie):")
+	parsePowerSetting(outputStr, "DC Setting Index")
 
 	return nil
 }
 
 func showHibernateSettings() error {
-	cmd := exec.Command("powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "HIBERNATEIDLE")
-	output, err := cmd.Output()
+	outputStr, err := runCommandWithEncoding("powercfg", "/query", "SCHEME_CURRENT", "SUB_SLEEP", "HIBERNATEIDLE")
 	if err != nil {
-		return fmt.Errorf("failed to get hibernate settings: %w", err)
+		return fmt.Errorf("Fehler beim Abrufen der Ruhezustand-Einstellungen: %w", err)
 	}
 
-	fmt.Println("\nHibernate Settings:")
-	parsePowerSetting(string(output), "Setting Index")
+	printUTF8ln("\nRuhezustand-Einstellungen:")
+	parsePowerSetting(outputStr, "Setting Index")
 	return nil
 }
 
-func showWakeDeviceSettings() error {
-	cmd := exec.Command("powercfg", "/devicequery", "wake_armed")
-	output, err := cmd.Output()
+// WMINetworkWakeInfo represents WMI information about network wake settings
+// Field names must match WMI property names exactly (case-sensitive)
+type WMINetworkWakeInfo struct {
+	InstanceName                string `wmi:"InstanceName"`
+	Active                      bool   `wmi:"Active"`
+	EnableWakeOnMagicPacketOnly bool   `wmi:"EnableWakeOnMagicPacketOnly"`
+}
+
+func showWakeDeviceSettings(full bool) error {
+	// Get all devices that are currently wake-armed
+	armedOutput, err := runCommandWithEncoding("powercfg", "/devicequery", "wake_armed")
 	if err != nil {
-		return fmt.Errorf("failed to get wake device settings: %w", err)
+		return fmt.Errorf("failed to get wake-armed devices: %w", err)
 	}
 
-	fmt.Println("\nDevices that can wake the computer:")
-	lines := strings.Split(string(output), "\n")
-	deviceCount := 0
-	for _, line := range lines {
+	// Get all devices that are wake-programmable (can potentially wake)
+	programmableOutput, err := runCommandWithEncoding("powercfg", "/devicequery", "wake_programmable")
+	if err != nil {
+		return fmt.Errorf("failed to get wake-programmable devices: %w", err)
+	}
+
+	// Parse wake-armed devices into a map for quick lookup
+	armedDevices := make(map[string]bool)
+	armedLines := strings.Split(armedOutput, "\n")
+	for _, line := range armedLines {
 		line = strings.TrimSpace(line)
 		if line != "" {
-			fmt.Printf("  - %s\n", line)
-			deviceCount++
+			armedDevices[line] = true
 		}
 	}
-	if deviceCount == 0 {
-		fmt.Println("  (none)")
+
+	// Parse wake-programmable devices
+	programmableLines := strings.Split(programmableOutput, "\n")
+	var programmableDevices []string
+	for _, line := range programmableLines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			programmableDevices = append(programmableDevices, line)
+		}
+	}
+
+	// Query WMI for network wake information (all devices, not just active ones)
+	var networkWakeInfo []WMINetworkWakeInfo
+	const NameSpace = "root\\wmi"
+
+	err = wmi.QueryNamespace("SELECT InstanceName, Active, EnableWakeOnMagicPacketOnly FROM MSNdis_DeviceWakeOnMagicPacketOnly", &networkWakeInfo, NameSpace)
+	if err != nil {
+		// WMI query failed, continue without WMI info
+		if verboseFlag {
+			printUTF8ln("Note: Could not query WMI for network wake info: %v", err)
+		}
+	}
+
+	type Win32_NetworkAdapter struct {
+		Name        string
+		PNPDeviceID string
+	}
+	var adapters []Win32_NetworkAdapter
+	idToName := make(map[string]string)
+
+	// Win32_NetworkAdapter liegt im Standard-Namespace root\cimv2
+	err = wmi.Query("SELECT Name, PNPDeviceID FROM Win32_NetworkAdapter", &adapters)
+	if err == nil {
+		for _, a := range adapters {
+			idToName[strings.ToLower(a.PNPDeviceID)] = a.Name
+		}
+	}
+	// Create a map of network device names from WMI
+	networkWakeMap := make(map[string]WMINetworkWakeInfo)
+	for _, info := range networkWakeInfo {
+		pnpID := strings.ToLower(info.InstanceName)
+		if lastUnderscore := strings.LastIndex(pnpID, "_"); lastUnderscore > -1 {
+			pnpID = pnpID[:lastUnderscore]
+		}
+
+		// Suche den Anzeigenamen basierend auf der ID
+		friendlyName, found := idToName[pnpID]
+		if !found {
+			// Fallback: Falls keine exakte ID-Übereinstimmung, suche per Teilstring in der ID-Map
+			for id, name := range idToName {
+				if strings.Contains(pnpID, id) || strings.Contains(id, pnpID) {
+					friendlyName = name
+					found = true
+					break
+				}
+			}
+		}
+
+		if found {
+			// Speichere unter dem Namen, den powercfg verwendet (normalisiert)
+			cleanName := strings.ToLower(strings.TrimSpace(friendlyName))
+			networkWakeMap[cleanName] = info
+
+			if verboseFlag {
+				printUTF8ln("Mapped WMI ID to Name: %s", friendlyName)
+			}
+		}
+	}
+
+	// Helper function to find WMI info for a device
+	findWMIInfo := func(deviceName string) (WMINetworkWakeInfo, bool) {
+		// Try exact match first
+		if info, found := networkWakeMap[deviceName]; found {
+			return info, true
+		}
+		// Try partial matching
+		deviceLower := strings.ToLower(deviceName)
+		for wmiName, wmiInfo := range networkWakeMap {
+			if strings.Contains(deviceLower, strings.ToLower(wmiName)) ||
+				strings.Contains(strings.ToLower(wmiName), deviceLower) {
+				return wmiInfo, true
+			}
+		}
+		return WMINetworkWakeInfo{}, false
+	}
+
+	// Separate devices into enabled and disabled
+	var enabledDevices []string
+	var disabledDevices []string
+	for _, device := range programmableDevices {
+		if armedDevices[device] {
+			enabledDevices = append(enabledDevices, device)
+		} else {
+			disabledDevices = append(disabledDevices, device)
+		}
+	}
+
+	// Display results
+	printUTF8ln("\n=== Aufweck-Geräte-Analyse ===")
+	if full {
+		printUTF8ln("\nGesamt aufweck-programmierbare Geräte: %d", len(programmableDevices))
+		printUTF8ln("Aktuell aufweck-aktivierte Geräte: %d\n", len(armedDevices))
+	} else {
+		printUTF8ln("\nAktuell aufweck-aktivierte Geräte: %d\n", len(armedDevices))
+	}
+
+	// Display enabled devices first
+	if len(enabledDevices) > 0 {
+		printUTF8ln("Aktivierte aufweck-programmierbare Geräte:")
+		for i, device := range enabledDevices {
+			printUTF8("  %d. %s", i+1, device)
+
+			// Check if this is a network device with WMI info
+			if wmiInfo, found := findWMIInfo(device); found {
+				if wmiInfo.EnableWakeOnMagicPacketOnly {
+					printUTF8(" - Magic-Packet: Aktiviert")
+				} else {
+					printUTF8(" - Magic-Packet: Deaktiviert")
+				}
+			}
+			printUTF8ln("")
+		}
+	}
+
+	// Display disabled devices only in full mode
+	if full && len(disabledDevices) > 0 {
+		if len(enabledDevices) > 0 {
+			printUTF8ln("")
+		}
+		printUTF8ln("Deaktivierte aufweck-programmierbare Geräte:")
+		for i, device := range disabledDevices {
+			printUTF8("  %d. %s", i+1, device)
+
+			// Always show Magic-Packet status for disabled network devices
+			if wmiInfo, found := findWMIInfo(device); found {
+				if wmiInfo.EnableWakeOnMagicPacketOnly {
+					printUTF8(" - Magic-Packet: Aktiviert")
+				} else {
+					printUTF8(" - Magic-Packet: Deaktiviert")
+				}
+			}
+			printUTF8ln("")
+		}
+	}
+
+	if len(programmableDevices) == 0 {
+		printUTF8ln("Keine aufweck-programmierbaren Geräte gefunden.")
 	}
 
 	return nil
@@ -93,31 +248,145 @@ func showWakeDeviceSettings() error {
 
 func parsePowerSetting(output, searchKey string) {
 	lines := strings.Split(output, "\n")
+
+	// Determine if we're looking for AC or DC setting based on searchKey
+	isAC := strings.Contains(searchKey, "AC") || strings.Contains(strings.ToUpper(searchKey), "AC")
+	isDC := strings.Contains(searchKey, "DC") || strings.Contains(strings.ToUpper(searchKey), "DC")
+
+	// German patterns: "Wechselstromeinstellung" (AC) and "Gleichstromeinstellung" (DC)
+	// English patterns: "AC Setting Index" and "DC Setting Index"
+
+	// Look for the German pattern first: "Index der aktuellen Wechselstromeinstellung" or "Index der aktuellen Gleichstromeinstellung"
+	var targetPattern string
+	if isAC {
+		targetPattern = "Wechselstromeinstellung"
+	} else if isDC {
+		targetPattern = "Gleichstromeinstellung"
+	} else {
+		// For hibernate, look for any "Index der aktuellen" line
+		targetPattern = "Index der aktuellen"
+	}
+
+	// Search for the pattern and extract hex value
 	for i, line := range lines {
-		if strings.Contains(line, searchKey) {
-			// Try to extract the value
-			re := regexp.MustCompile(`(\d+)`)
-			matches := re.FindStringSubmatch(line)
-			if len(matches) > 1 {
-				value, err := strconv.Atoi(matches[1])
-				if err == nil {
-					// Convert to minutes (value is in seconds)
-					minutes := value / 60
-					if minutes > 0 {
-						fmt.Printf("  Timeout: %d minutes\n", minutes)
-					} else {
-						fmt.Printf("  Timeout: %d seconds (disabled)\n", value)
+		if strings.Contains(line, targetPattern) {
+			// Look for hex value in this line or next few lines
+			for j := i; j < len(lines) && j < i+3; j++ {
+				currentLine := lines[j]
+
+				// Look for hex pattern: "0x00003840" (without parentheses in German output)
+				re := regexp.MustCompile(`0x([0-9a-fA-F]+)`)
+				matches := re.FindStringSubmatch(currentLine)
+				if len(matches) > 1 {
+					// Parse hex value
+					value, err := strconv.ParseInt(matches[1], 16, 64)
+					if err == nil {
+						// Value is in seconds, use formatDuration for consistent formatting
+						seconds := int(value)
+						if seconds == 0 {
+							printUTF8ln("  Timeout: Deaktiviert")
+						} else {
+							duration := time.Duration(seconds) * time.Second
+							timeoutStr := formatDuration(duration)
+							printUTF8ln("  Timeout: %s", timeoutStr)
+						}
+						return
+					}
+				}
+
+				// Also try pattern with parentheses: "0x00000708 (1800)"
+				re2 := regexp.MustCompile(`0x[0-9a-fA-F]+\s*\((\d+)\)`)
+				matches2 := re2.FindStringSubmatch(currentLine)
+				if len(matches2) > 1 {
+					value, err := strconv.Atoi(matches2[1])
+					if err == nil {
+						if value == 0 {
+							printUTF8ln("  Timeout: Deaktiviert")
+						} else {
+							duration := time.Duration(value) * time.Second
+							timeoutStr := formatDuration(duration)
+							printUTF8ln("  Timeout: %s", timeoutStr)
+						}
+						return
 					}
 				}
 			}
-			// Show next few lines for context
-			for j := i + 1; j < len(lines) && j < i+3; j++ {
-				if strings.TrimSpace(lines[j]) != "" {
-					fmt.Printf("  %s\n", strings.TrimSpace(lines[j]))
+		}
+	}
+
+	// Fallback: Try English patterns
+	searchPatterns := []string{
+		"Current AC Power Setting Index",
+		"Current DC Power Setting Index",
+		"AC Setting Index",
+		"DC Setting Index",
+		"Setting Index",
+	}
+
+	for _, pattern := range searchPatterns {
+		if isAC && strings.Contains(pattern, "DC") {
+			continue
+		}
+		if isDC && strings.Contains(pattern, "AC") {
+			continue
+		}
+
+		for i, line := range lines {
+			if strings.Contains(line, pattern) {
+				for j := i; j < len(lines) && j < i+10; j++ {
+					currentLine := lines[j]
+
+					// Look for hex pattern
+					re := regexp.MustCompile(`0x([0-9a-fA-F]+)`)
+					matches := re.FindStringSubmatch(currentLine)
+					if len(matches) > 1 {
+						value, err := strconv.ParseInt(matches[1], 16, 64)
+						if err == nil {
+							seconds := int(value)
+							if seconds == 0 {
+								printUTF8ln("  Timeout: Deaktiviert")
+							} else {
+								duration := time.Duration(seconds) * time.Second
+								timeoutStr := formatDuration(duration)
+								printUTF8ln("  Timeout: %s", timeoutStr)
+							}
+							return
+						}
+					}
+
+					// Try pattern with parentheses
+					re2 := regexp.MustCompile(`0x[0-9a-fA-F]+\s*\((\d+)\)`)
+					matches2 := re2.FindStringSubmatch(currentLine)
+					if len(matches2) > 1 {
+						value, err := strconv.Atoi(matches2[1])
+						if err == nil && value >= 0 && value <= 86400 {
+							if value == 0 {
+								printUTF8ln("  Timeout: Deaktiviert")
+							} else {
+								duration := time.Duration(value) * time.Second
+								timeoutStr := formatDuration(duration)
+								printUTF8ln("  Timeout: %s", timeoutStr)
+							}
+							return
+						}
+					}
 				}
 			}
-			break
 		}
+	}
+
+	// If still not found, show debug info or default message
+	if debugFlag {
+		printUTF8ln("  Einstellung nicht gefunden (Suchschlüssel: %s)", searchKey)
+		printUTF8ln("  Erste 30 Zeilen der Ausgabe zum Debuggen:")
+		for i, line := range lines {
+			if i >= 30 {
+				break
+			}
+			printUTF8ln("    %d: %s", i, strings.TrimSpace(line))
+		}
+	} else {
+		printUTF8ln("  Timeout: Nicht konfiguriert oder nicht verfügbar")
 	}
 }
 
@@ -179,10 +448,10 @@ func configureWakeDevices() error {
 		lines := strings.Split(string(output), "\n")
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
-			if strings.Contains(strings.ToLower(line), "ethernet") || 
-			   strings.Contains(strings.ToLower(line), "network") ||
-			   strings.Contains(strings.ToLower(line), "realtek") ||
-			   strings.Contains(strings.ToLower(line), "intel") {
+			if strings.Contains(strings.ToLower(line), "ethernet") ||
+				strings.Contains(strings.ToLower(line), "network") ||
+				strings.Contains(strings.ToLower(line), "realtek") ||
+				strings.Contains(strings.ToLower(line), "intel") {
 				cmd = exec.Command("powercfg", "/deviceenablewake", line)
 				if err := cmd.Run(); err != nil {
 					if verboseFlag {
@@ -300,11 +569,11 @@ func configureWakeTimers() error {
 	// Subgroup ID: 29f6c1db-86da-48c5-9fdb-f2b67b1f44da (Sleep)
 	// Setting ID: bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d (Allow wake timers)
 	// Value: 0 = Disabled, 1 = Enabled (AC), 2 = Enabled (DC), 3 = Enabled (Both)
-	
+
 	// For AC power: set to 0 (Disabled)
-	cmd = exec.Command("powercfg", "/setacvalueindex", schemeGUID, 
-		"238c9fa8-0aad-41ed-83f4-97be242c8f20", 
-		"29f6c1db-86da-48c5-9fdb-f2b67b1f44da", 
+	cmd = exec.Command("powercfg", "/setacvalueindex", schemeGUID,
+		"238c9fa8-0aad-41ed-83f4-97be242c8f20",
+		"29f6c1db-86da-48c5-9fdb-f2b67b1f44da",
 		"bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d", "0")
 	if err := cmd.Run(); err != nil {
 		if verboseFlag {
@@ -332,4 +601,3 @@ func configureWakeTimers() error {
 	fmt.Println("  Wake timers disabled (scheduled tasks will not wake the system).")
 	return nil
 }
-
